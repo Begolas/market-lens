@@ -65,7 +65,7 @@ const AV_FREE_ENDPOINTS = {
   DAILY: { function: "TIME_SERIES_DAILY", outputsize: "compact" },
 };
 
-function normalizeAvError(data) {
+function normalizeAvError(data, fn) {
   const note = data?.Note || "";
   const info = data?.Information || "";
   if (note) {
@@ -74,7 +74,12 @@ function normalizeAvError(data) {
     }
     return "Alpha Vantage Hinweis: Anfrage aktuell nicht verfügbar (Free-Tier-Limit).";
   }
-  if (info && /premium|subscription/i.test(info)) return "Nicht verfügbar im Free-Tier.";
+  if (info && /premium|subscription/i.test(info)) {
+    if (fn === "TIME_SERIES_DAILY") {
+      return "Alpha Vantage Antwort unklar für Daily-Endpoint. Bitte erneut versuchen (Key-Rotation aktiv).";
+    }
+    return "Nicht verfügbar im Free-Tier.";
+  }
   if (data?.["Error Message"]) return "Symbol nicht gefunden oder Anfrage ungültig.";
   return null;
 }
@@ -84,14 +89,14 @@ async function avFetch(params, budgetOpts = {}) {
   const r = await fetch(AV + "?" + new URLSearchParams(params));
   if (!r.ok) throw new Error("HTTP " + r.status);
   const data = await r.json();
-  const normalized = normalizeAvError(data);
+  const normalized = normalizeAvError(data, params?.function);
   if (normalized) throw new Error(normalized);
   return data;
 }
 
 function isRetryableAvError(err) {
   const m = String(err?.message || "");
-  return /Rate-Limit|Free-Tier-Limit|calls per minute|calls per day|Nicht verfügbar im Free-Tier|premium|subscription/i.test(m);
+  return /Rate-Limit|Free-Tier-Limit|calls per minute|calls per day|Nicht verfügbar im Free-Tier|premium|subscription|Antwort unklar/i.test(m);
 }
 
 async function avFetchWithFallback(makeParams, preferredKey, budgetOpts = {}, extraKeys = []) {
