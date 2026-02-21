@@ -65,23 +65,38 @@ const AV_FREE_ENDPOINTS = {
   DAILY: { function: "TIME_SERIES_DAILY", outputsize: "compact" },
 };
 
-function normalizeAvError(data, fn) {
+function normalizeAvError(data) {
   const note = data?.Note || "";
   const info = data?.Information || "";
-  if (note) {
-    if (/rate limit|calls per minute|calls per day/i.test(note)) {
-      return "Rate-Limit erreicht (Free: 5/Min, 25/Tag). Bitte kurz warten und erneut versuchen.";
+  const msg = `${note} ${info}`.trim();
+  if (msg) {
+    if (/rate limit|calls per minute|calls per day|1 request per second/i.test(msg)) {
+      return "Rate-Limit erreicht (Free: 1/Sek, 25/Tag). Bitte kurz warten oder anderen Key nutzen.";
     }
-    return "Alpha Vantage Hinweis: Anfrage aktuell nicht verfügbar (Free-Tier-Limit).";
-  }
-  if (info && /premium|subscription/i.test(info)) {
-    if (fn === "TIME_SERIES_DAILY") {
-      return "Alpha Vantage Antwort unklar für Daily-Endpoint. Bitte erneut versuchen (Key-Rotation aktiv).";
+    if (/premium|subscription|unlock all premium endpoints/i.test(msg)) {
+      return "Alpha Vantage meldet Einschränkung/Limit für diesen Key.";
     }
-    return "Nicht verfügbar im Free-Tier.";
+    return "Alpha Vantage Hinweis: Anfrage aktuell nicht verfügbar.";
   }
   if (data?.["Error Message"]) return "Symbol nicht gefunden oder Anfrage ungültig.";
   return null;
+}
+
+function maskApiKey(key) {
+  const k = String(key || "");
+  if (!k) return "";
+  if (k.length <= 6) return "***";
+  return `${k.slice(0, 4)}…${k.slice(-2)}`;
+}
+
+function headerSnapshot(headers) {
+  const wanted = ["content-type", "date", "retry-after", "cache-control", "server", "via"];
+  const out = {};
+  wanted.forEach((h) => {
+    const v = headers?.get?.(h);
+    if (v) out[h] = v;
+  });
+  return out;
 }
 
 async function avFetch(params, budgetOpts = {}) {
@@ -89,7 +104,7 @@ async function avFetch(params, budgetOpts = {}) {
   const r = await fetch(AV + "?" + new URLSearchParams(params));
   if (!r.ok) throw new Error("HTTP " + r.status);
   const data = await r.json();
-  const normalized = normalizeAvError(data, params?.function);
+  const normalized = normalizeAvError(data);
   if (normalized) throw new Error(normalized);
   return data;
 }
@@ -146,7 +161,7 @@ function aggregateCandles(daily, mode) {
   return [...by.values()].sort((a, b) => a.date - b.date);
 }
 
-async function fetchCandles(symbol, interval, apiKey, { force = false, extraKeys = [] } = {}) {
+async function fetchCandles(symbol, interval, apiKey, { force = false, extraKeys = [], onDebug } = {}) {
   const key = `candles:${symbol}:daily`;
   const now = Date.now();
   const hit = await idb.get(idb.stores.candles, key);
@@ -163,27 +178,39 @@ async function fetchCandles(symbol, interval, apiKey, { force = false, extraKeys
   let lastErr = null;
   for (const k of keys) {
     try {
+      const params = { ...AV_FREE_ENDPOINTS.DAILY, symbol, apikey: k };
       await takeApiBudget({ critical: true });
-      const r = await fetch(AV + "?" + new URLSearchParams({ ...AV_FREE_ENDPOINTS.DAILY, symbol, apikey: k }));
+      const r = await fetch(AV + "?" + new URLSearchParams(params));
       if (!r.ok) {
-        lastErr = new Error("HTTP " + r.status);
+        const err = new Error("HTTP " + r.status);
+        onDebug?.({ params: { ...params, apikey: maskApiKey(k) }, responseKeys: [], headers: headerSnapshot(r.headers), error: err.message });
+        lastErr = err;
         continue;
       }
       const json = await r.json();
-      const tsKeyCandidate = Object.keys(json || {}).find((x) => x.startsWith("Time Series"));
+      const responseKeys = Object.keys(json || {});
+      const tsKeyCandidate = responseKeys.find((x) => x.startsWith("Time Series"));
       if (tsKeyCandidate) {
         data = json;
+        onDebug?.({ params: { ...params, apikey: maskApiKey(k) }, responseKeys, headers: headerSnapshot(r.headers), error: null, successAt: new Date().toISOString() });
         break;
       }
-      const normalized = normalizeAvError(json, "TIME_SERIES_DAILY");
+      const normalized = normalizeAvError(json);
       lastErr = new Error(normalized || "Keine Daily-Daten in API-Antwort.");
-      // nächster Key
+      onDebug?.({ params: { ...params, apikey: maskApiKey(k) }, responseKeys, headers: headerSnapshot(r.headers), error: lastErr.message });
     } catch (e) {
       lastErr = e;
+      onDebug?.({ error: e?.message || String(e) });
     }
   }
 
-  if (!data) throw (lastErr || new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen."));
+  if (!data) {
+    if (hit?.data?.length) {
+      onDebug?.({ error: (lastErr?.message || "API Fehler") + " · zeige Cache" });
+      return aggregateCandles(deserializeCandles(hit.data), interval);
+    }
+    throw (lastErr || new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen."));
+  }
 
   const tsKey = Object.keys(data).find((k) => k.startsWith("Time Series"));
   if (!tsKey) throw new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen.");
@@ -556,6 +583,8 @@ export default function FinanceMVP() {
   const [candles, setCandles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState(null);
+  const [apiDebugOpen, setApiDebugOpen] = useState(false);
+  const [apiDebug, setApiDebug] = useState({ params: null, responseKeys: [], headers: {}, error: null, successAt: null });
 
   // Search + local index
   const [searchQ,    setSearchQ]    = useState("");
@@ -580,7 +609,10 @@ export default function FinanceMVP() {
     if (!key) return;
     setLoading(true); setError(null); setTablePage(0);
     try {
-      const raw = await fetchCandles(sym, interval, key, opts);
+      const raw = await fetchCandles(sym, interval, key, {
+        ...opts,
+        onDebug: (d) => setApiDebug((prev) => ({ ...prev, ...d, successAt: d?.successAt || prev.successAt })),
+      });
       setCandles(raw);
       LS.raw("lastSymbol", sym);
       const b = await readBudget();
@@ -658,6 +690,22 @@ export default function FinanceMVP() {
   const tableData  = useMemo(()=>[...candles].reverse(),[candles]);
   const tablePaged = tableData.slice(tablePage*ROWS,(tablePage+1)*ROWS);
   const totalPages = Math.ceil(tableData.length/ROWS);
+
+  const apiDebugBox = (
+    <div style={{marginTop:8,background:C.panel,border:"1px solid "+C.border,borderRadius:10,padding:"8px 10px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+        <span style={{fontSize:10,color:C.muted,letterSpacing:1}}>API DEBUG</span>
+        <button className="btn" onClick={()=>setApiDebugOpen(v=>!v)} style={{padding:"2px 8px",borderRadius:6,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>{apiDebugOpen?"ausblenden":"anzeigen"}</button>
+      </div>
+      {apiDebugOpen && <div style={{marginTop:8,fontSize:11,color:C.text,display:"grid",gap:4}}>
+        <div><span style={{color:C.muted}}>Params:</span> {apiDebug.params ? JSON.stringify(apiDebug.params) : "-"}</div>
+        <div><span style={{color:C.muted}}>Top-Level Keys:</span> {(apiDebug.responseKeys || []).join(", ") || "-"}</div>
+        <div><span style={{color:C.muted}}>Headers:</span> {Object.keys(apiDebug.headers || {}).length ? JSON.stringify(apiDebug.headers) : "-"}</div>
+        <div><span style={{color:C.muted}}>Error:</span> {apiDebug.error || "-"}</div>
+        <div><span style={{color:C.muted}}>Last Success:</span> {apiDebug.successAt ? new Date(apiDebug.successAt).toLocaleString("de-DE") : "-"}</div>
+      </div>}
+    </div>
+  );
 
   // ── API Key Screen ─────────────────────────────────────────────
   if (!confirmed) return (
@@ -815,6 +863,8 @@ export default function FinanceMVP() {
             )}
           </div>
 
+          <div style={{padding:"0 16px 8px"}}>{apiDebugBox}</div>
+
           {/* Stats */}
           {stats&&<div style={{padding:"0 16px 12px",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(135px,1fr))",gap:8}}>
             <StatCard label="Aktuell" value={stats.last.toFixed(2)}/>
@@ -954,6 +1004,8 @@ export default function FinanceMVP() {
             <div style={{display:"flex",gap:6,padding:"10px 10px 0",overflowX:"auto"}}>
               {["none","rsi","macd","volume"].map(t=><button key={t} className="btn" onClick={()=>updateLayout({subChart:t})} style={{padding:"4px 12px",borderRadius:20,fontSize:11,border:"1px solid "+C.border,background:layout.subChart===t?"#1e2a40":C.card,color:layout.subChart===t?C.text:C.muted,flexShrink:0}}>{t==="none"?"— Sub":t.toUpperCase()}</button>)}
             </div>
+
+            <div style={{padding:"10px 10px 0"}}>{apiDebugBox}</div>
 
             {/* Stats grid */}
             {stats&&<div style={{padding:"10px",display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>

@@ -36,6 +36,27 @@ npm start
 - In den Einstellungen kannst du zusätzliche Alpha-Vantage-Keys lokal speichern.
 - Zusätzliche Keys werden als Fallback-Rotation genutzt, um Ausfälle bei Limits zu reduzieren.
 
+## Self-Check (1 Symbol, 1 Minute)
+
+```bash
+npm install
+npm start
+```
+
+Dann in der App:
+1. Symbol `AAPL` laden (oder Favorit antippen)
+2. ggf. **↻ Refresh** drücken
+3. **API Debug → anzeigen** aufklappen
+
+Erfolg sieht so aus:
+- Chart + OHLCV-Tabelle sind sichtbar
+- API Debug zeigt `function: TIME_SERIES_DAILY` und Top-Level-Key `Time Series (Daily)`
+- `Last Success` ist gesetzt
+
+Wenn API limitiert ist:
+- API Debug zeigt `Information`/Rate-Limit-Fehler
+- bei vorhandenem Cache werden trotzdem Candle-Daten angezeigt
+
 ## Deployment Update
 
 Änderungen pushen → Vercel deployed automatisch neu.

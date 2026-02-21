@@ -1,40 +1,55 @@
-# Implementation Plan — Alpha Vantage Free Tier Enforcement
+# IMPLEMENTATION PLAN — Ralph Mode Reset/Fix (2026-02-21)
 
-## Scope
-Enforce Free-tier-only MVP behavior (no premium endpoints/flows), with centralized endpoint mapping and robust limit handling.
+## 1) Root-cause with real API calls (done first)
+Live calls executed against app-used endpoints with embedded keys:
+- `TIME_SERIES_DAILY`
+- `SYMBOL_SEARCH`
+- `LISTING_STATUS`
 
-## Tasks
-1. **Audit API + UI usage**
-   - Locate all Alpha Vantage endpoint calls and any premium/intraday/adjusted references.
-   - Verify UI cannot select unsupported timeframes.
+### Observed responses (both embedded keys)
+Keys tested:
+- `PBGV8GAJ362XPAY6`
+- `16QCQ1L3KRI9DOM5`
 
-2. **Centralize endpoint mapping (single source of truth)**
-   - Introduce one constant map for allowed endpoints:
-     - `SYMBOL_SEARCH`
-     - `TIME_SERIES_DAILY` (compact)
-     - `TIME_SERIES_WEEKLY`
-     - `TIME_SERIES_MONTHLY`
-   - Route all API calls through this map.
+`TIME_SERIES_DAILY` and `SYMBOL_SEARCH` returned HTTP 200 JSON:
+```json
+{
+  "Information": "Thank you for using Alpha Vantage! ... (1 request per second) ... (25 requests per day) ... premium ..."
+}
+```
+`LISTING_STATUS` returned HTTP 200 with JSON body `{}` (not CSV payload).
 
-3. **Harden API error handling**
-   - Normalize Alpha Vantage `Note` / `Information` / `Error Message` payloads.
-   - Provide clear Free-tier specific messages for rate limits and unavailable premium features.
+Relevant response headers seen:
+- `content-type: application/json`
+- `date: ...`
+- `via: 2.0 heroku-router`
+- `server: cloudflare`
+- No explicit `retry-after` header in observed responses.
 
-4. **Constrain UI state**
-   - Sanitize persisted `timeRange` from localStorage to free-safe values only (`1D`, `1W`, `1Mo`).
-   - Ensure layout updates cannot set unsupported intervals.
+### Exact root-cause
+The app previously mapped `Information` + `premium/subscription` text to a **misleading Daily-specific error** (`"Alpha Vantage Antwort unklar..."`).
+Alpha Vantage rate-limit/info messages include premium wording, so valid limit/info responses were misclassified as “unclear daily response”.
 
-5. **Documentation updates**
-   - Add `FREE_TIER_NOTES.md` with allowed endpoints and limits.
-   - Update `README.md` with Free-tier-only behavior and indicator implementation note (client-side TA).
+## 2) MVP data path rebuild (minimal + robust)
+- Keep free-tier endpoint only for chart baseline: `TIME_SERIES_DAILY`.
+- Preserve key rotation, but remove fragile “unclear daily” classification.
+- Add stale-cache fallback if API is unavailable so chart/table still render when cache exists.
 
-6. **Validation + commit**
-   - Run `npm run build` and fix issues.
-   - Commit with message: `MVP: enforce Alpha Vantage free-tier endpoints only`.
+## 3) UI diagnostics visibility
+Add compact API Debug panel (toggle):
+- Last request params (API key masked)
+- Response top-level keys
+- Error message
+- Header snapshot
+- Last successful fetch timestamp
 
-## Audit Findings (violations found)
-- Endpoint selection logic in code was **not centralized** (inline branching in `fetchCandles`), making future premium regressions easier.
-- Error handling treated `Information` generically as premium but lacked robust normalization for varying Alpha Vantage `Note` responses.
-- Persisted layout could theoretically carry a stale/unsupported interval from storage without explicit sanitization guard.
+## 4) Call-minimal but correctness-first
+- Manual refresh retained.
+- Correctness favored over aggressive suppression (still fetches daily when needed).
 
-_No active premium endpoint calls were found in current MVP; main fixes are hardening + regression prevention._
+## 5) Validation
+- Build must pass: `npm run build`
+- Add README self-check section for one-symbol sanity test.
+
+## 6) Delivery
+- Commit and push to `main` after successful build.
