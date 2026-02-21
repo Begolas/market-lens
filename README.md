@@ -51,6 +51,19 @@ npm start
 # → öffnet http://localhost:3000
 ```
 
+## Free-Tier Verhalten (MVP)
+
+Dieses MVP nutzt bewusst nur Alpha-Vantage-Free-Endpunkte:
+- `SYMBOL_SEARCH`
+- `TIME_SERIES_DAILY` (compact)
+- `TIME_SERIES_WEEKLY`
+- `TIME_SERIES_MONTHLY`
+
+Nicht genutzt: Intraday/Adjusted/Premium-Indikator-Endpunkte.
+Indikatoren (SMA/EMA/RSI/MACD usw.) werden lokal aus OHLCV berechnet.
+
+Details: siehe `FREE_TIER_NOTES.md`.
+
 ## Update deployen
 
 Dateien auf GitHub aktualisieren → Vercel deployed automatisch neu.

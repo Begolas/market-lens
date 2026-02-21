@@ -18,41 +18,73 @@ const LS = {
   del:  (k)    => { try { localStorage.removeItem(k); } catch {} },
 };
 
-// ─── Alpha Vantage ────────────────────────────────────────────────
+// ─── Alpha Vantage (Free Tier only) ──────────────────────────────
 const AV = "https://www.alphavantage.co/query";
-async function avFetch(p) { const r = await fetch(AV+"?"+new URLSearchParams(p)); if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); }
+const AV_FREE_ENDPOINTS = {
+  SYMBOL_SEARCH: { function: "SYMBOL_SEARCH" },
+  CANDLES: {
+    "1D": { function: "TIME_SERIES_DAILY", outputsize: "compact" },
+    "1W": { function: "TIME_SERIES_WEEKLY" },
+    "1Mo": { function: "TIME_SERIES_MONTHLY" },
+  },
+};
+
+function normalizeAvError(data) {
+  const note = data?.Note || "";
+  const info = data?.Information || "";
+  if (note) {
+    if (/rate limit|calls per minute|calls per day/i.test(note)) {
+      return "Rate-Limit erreicht (Free: 5/Min, 25/Tag). Bitte kurz warten und erneut versuchen.";
+    }
+    return "Alpha Vantage Hinweis: Anfrage aktuell nicht verfügbar (Free-Tier-Limit).";
+  }
+  if (info && /premium|subscription/i.test(info)) {
+    return "Nicht verfügbar im Free-Tier. Bitte nur Tages-/Wochen-/Monatsdaten nutzen.";
+  }
+  if (data?.["Error Message"]) return "Symbol nicht gefunden oder Anfrage ungültig.";
+  return null;
+}
+
+async function avFetch(params) {
+  const r = await fetch(AV + "?" + new URLSearchParams(params));
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const data = await r.json();
+  const normalized = normalizeAvError(data);
+  if (normalized) throw new Error(normalized);
+  return data;
+}
+
+function getFreeCandleParams(symbol, interval, apiKey) {
+  const safeInterval = AV_FREE_ENDPOINTS.CANDLES[interval] ? interval : "1D";
+  return { ...AV_FREE_ENDPOINTS.CANDLES[safeInterval], symbol, apikey: apiKey };
+}
 
 async function fetchCandles(symbol, interval, apiKey) {
-  const key = "av_"+symbol+"_"+interval;
+  const safeInterval = AV_FREE_ENDPOINTS.CANDLES[interval] ? interval : "1D";
+  const key = "av_" + symbol + "_" + safeInterval;
   const hit = LS.get(key);
-  if (hit) return hit.map(c => ({...c, date: new Date(c.date)}));
-  let params;
-  // Free-tier only: ADJUSTED + INTRADAY are Premium-only
-  if      (interval==="1D")  params = {function:"TIME_SERIES_DAILY",   symbol, outputsize:"compact", apikey:apiKey};
-  else if (interval==="1W")  params = {function:"TIME_SERIES_WEEKLY",  symbol, apikey:apiKey};
-  else if (interval==="1Mo") params = {function:"TIME_SERIES_MONTHLY", symbol, apikey:apiKey};
-  else                        params = {function:"TIME_SERIES_DAILY",   symbol, outputsize:"compact", apikey:apiKey}; // Intraday=Premium, fallback Daily
-  const data = await avFetch(params);
-  if (data["Information"]) throw new Error("Premium-Endpoint: Bitte 'TIME_SERIES_DAILY' verwenden (Free Key)");
-  if (data["Note"]) throw new Error("Rate limit: max. 25 req/Tag oder 5/Min. erreicht – kurz warten");
-  if (data["Error Message"]) throw new Error("Symbol nicht gefunden");
+  if (hit) return hit.map(c => ({ ...c, date: new Date(c.date) }));
+
+  const data = await avFetch(getFreeCandleParams(symbol, safeInterval, apiKey));
   const tsKey = Object.keys(data).find(k => k.startsWith("Time Series"));
-  if (!tsKey) throw new Error("Keine Daten erhalten");
-  const candles = Object.entries(data[tsKey]).map(([date,v]) => ({
+  if (!tsKey) throw new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen.");
+
+  const candles = Object.entries(data[tsKey]).map(([date, v]) => ({
     date: new Date(date),
-    open:   parseFloat(v["1. open"]),
-    high:   parseFloat(v["2. high"]),
-    low:    parseFloat(v["3. low"]),
-    close:  parseFloat(v["4. close"]),
-    volume: parseInt(v["5. volume"]||"0"),
-  })).sort((a,b)=>a.date-b.date);
-  LS.set(key, candles.map(c=>({...c, date:c.date.toISOString()})));
+    open: parseFloat(v["1. open"]),
+    high: parseFloat(v["2. high"]),
+    low: parseFloat(v["3. low"]),
+    close: parseFloat(v["4. close"]),
+    volume: parseInt(v["5. volume"] || "0", 10),
+  })).sort((a, b) => a.date - b.date);
+
+  LS.set(key, candles.map(c => ({ ...c, date: c.date.toISOString() })));
   return candles;
 }
 
 async function searchSymbols(q, apiKey) {
-  const data = await avFetch({function:"SYMBOL_SEARCH", keywords:q, apikey:apiKey});
-  return (data.bestMatches||[]).map(m=>({symbol:m["1. symbol"],name:m["2. name"],type:m["3. type"],region:m["4. region"],currency:m["8. currency"]}));
+  const data = await avFetch({ ...AV_FREE_ENDPOINTS.SYMBOL_SEARCH, keywords: q, apikey: apiKey });
+  return (data.bestMatches || []).map(m => ({ symbol: m["1. symbol"], name: m["2. name"], type: m["3. type"], region: m["4. region"], currency: m["8. currency"] }));
 }
 
 // ─── TA ───────────────────────────────────────────────────────────
@@ -82,8 +114,9 @@ const ALL_IND = [
   {id:"rsi",    label:"RSI",       color:"#a78bfa", group:"Oszillator"},
   {id:"macd",   label:"MACD",      color:"#34d399", group:"Oszillator"},
 ];
-const INTERVALS = ["1D","1W","1Mo"]; // Free tier: no intraday (Premium only)
+const INTERVALS = ["1D","1W","1Mo"]; // Free tier only (no intraday/adjusted)
 const IV_LABEL  = {"1D":"Täglich","1W":"Wöchentl.","1Mo":"Monatl."};
+const sanitizeInterval = (v) => INTERVALS.includes(v) ? v : "1D";
 const C = { bg:"#060b11",panel:"#0a0f16",card:"#0d1520",border:"#1a2030",border2:"#1e2a38",text:"#e2e8f0",muted:"#5a6a7e",dim:"#1e2a38",up:"#22d3a5",down:"#f87171",accent:"#22d3a5" };
 
 // ─── useIsMobile hook ─────────────────────────────────────────────
@@ -331,8 +364,16 @@ export default function FinanceMVP() {
   const [confirmed, setConfirmed] = useState(()=>!!LS.raw("apiKey"));
 
   // Layout (persisted)
-  const [layout, setLayout] = useState(()=>({...DEFAULT_LAYOUT,...(LS.raw("layout")||{})}));
-  const updateLayout = patch => setLayout(prev=>{ const n={...prev,...patch}; LS.raw("layout",n); return n; });
+  const [layout, setLayout] = useState(() => {
+    const merged = { ...DEFAULT_LAYOUT, ...(LS.raw("layout") || {}) };
+    return { ...merged, timeRange: sanitizeInterval(merged.timeRange) };
+  });
+  const updateLayout = patch => setLayout(prev=>{
+    const n = { ...prev, ...patch };
+    n.timeRange = sanitizeInterval(n.timeRange);
+    LS.raw("layout", n);
+    return n;
+  });
   const resetLayout  = ()   => { LS.raw("layout",DEFAULT_LAYOUT); setLayout({...DEFAULT_LAYOUT}); };
 
   // Favorites
