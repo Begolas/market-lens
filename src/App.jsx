@@ -58,11 +58,11 @@ async function avFetch(params) {
 
 function isRetryableAvError(err) {
   const m = String(err?.message || "");
-  return /Rate-Limit|Free-Tier-Limit|calls per minute|calls per day/i.test(m);
+  return /Rate-Limit|Free-Tier-Limit|calls per minute|calls per day|Nicht verfügbar im Free-Tier|premium|subscription/i.test(m);
 }
 
 async function avFetchWithFallback(makeParams, preferredKey) {
-  const keys = [preferredKey, EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY]
+  const keys = [EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY, preferredKey]
     .filter(Boolean)
     .filter((k, i, a) => a.indexOf(k) === i);
 
