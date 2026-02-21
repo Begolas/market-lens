@@ -20,6 +20,8 @@ const LS = {
 
 // ─── Alpha Vantage (Free Tier only) ──────────────────────────────
 const AV = "https://www.alphavantage.co/query";
+const EMBEDDED_AV_PRIMARY_KEY = "PBGV8GAJ362XPAY6";
+const EMBEDDED_AV_FALLBACK_KEY = "16QCQ1L3KRI9DOM5";
 const AV_FREE_ENDPOINTS = {
   SYMBOL_SEARCH: { function: "SYMBOL_SEARCH" },
   CANDLES: {
@@ -54,6 +56,28 @@ async function avFetch(params) {
   return data;
 }
 
+function isRetryableAvError(err) {
+  const m = String(err?.message || "");
+  return /Rate-Limit|Free-Tier-Limit|calls per minute|calls per day/i.test(m);
+}
+
+async function avFetchWithFallback(makeParams, preferredKey) {
+  const keys = [preferredKey, EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY]
+    .filter(Boolean)
+    .filter((k, i, a) => a.indexOf(k) === i);
+
+  let lastErr = null;
+  for (const key of keys) {
+    try {
+      return await avFetch(makeParams(key));
+    } catch (e) {
+      lastErr = e;
+      if (!isRetryableAvError(e)) throw e;
+    }
+  }
+  throw lastErr || new Error("Alpha Vantage Anfrage fehlgeschlagen.");
+}
+
 function getFreeCandleParams(symbol, interval, apiKey) {
   const safeInterval = AV_FREE_ENDPOINTS.CANDLES[interval] ? interval : "1D";
   return { ...AV_FREE_ENDPOINTS.CANDLES[safeInterval], symbol, apikey: apiKey };
@@ -65,7 +89,7 @@ async function fetchCandles(symbol, interval, apiKey) {
   const hit = LS.get(key);
   if (hit) return hit.map(c => ({ ...c, date: new Date(c.date) }));
 
-  const data = await avFetch(getFreeCandleParams(symbol, safeInterval, apiKey));
+  const data = await avFetchWithFallback((key) => getFreeCandleParams(symbol, safeInterval, key), apiKey);
   const tsKey = Object.keys(data).find(k => k.startsWith("Time Series"));
   if (!tsKey) throw new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen.");
 
@@ -83,7 +107,10 @@ async function fetchCandles(symbol, interval, apiKey) {
 }
 
 async function searchSymbols(q, apiKey) {
-  const data = await avFetch({ ...AV_FREE_ENDPOINTS.SYMBOL_SEARCH, keywords: q, apikey: apiKey });
+  const data = await avFetchWithFallback(
+    (key) => ({ ...AV_FREE_ENDPOINTS.SYMBOL_SEARCH, keywords: q, apikey: key }),
+    apiKey
+  );
   return (data.bestMatches || []).map(m => ({ symbol: m["1. symbol"], name: m["2. name"], type: m["3. type"], region: m["4. region"], currency: m["8. currency"] }));
 }
 
@@ -359,9 +386,9 @@ export default function FinanceMVP() {
   const isMobile = useIsMobile();
 
   // API Key
-  const [apiKey,    setApiKey]    = useState(()=>LS.raw("apiKey")||"");
+  const [apiKey,    setApiKey]    = useState(()=>LS.raw("apiKey")||EMBEDDED_AV_PRIMARY_KEY);
   const [keyInput,  setKeyInput]  = useState("");
-  const [confirmed, setConfirmed] = useState(()=>!!LS.raw("apiKey"));
+  const [confirmed, setConfirmed] = useState(true);
 
   // Layout (persisted)
   const [layout, setLayout] = useState(() => {
@@ -510,7 +537,7 @@ export default function FinanceMVP() {
           {[["candle","🕯 Kerze"],["line","📈 Linie"]].map(([t,l])=><button key={t} className="btn" onClick={()=>updateLayout({chartType:t})} style={{padding:"3px 10px",borderRadius:5,background:layout.chartType===t?"#1e2a40":"transparent",color:layout.chartType===t?C.text:C.muted,fontSize:11}}>{l}</button>)}
         </div>
         <button className="btn" onClick={resetLayout} style={{padding:"4px 10px",borderRadius:7,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>↺ Reset</button>
-        <button className="btn" onClick={()=>{LS.del("apiKey");setConfirmed(false);setApiKey("");}} style={{padding:"4px 10px",borderRadius:7,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:11}}>⏏ API Key</button>
+        <button className="btn" onClick={()=>{LS.del("apiKey");setApiKey(EMBEDDED_AV_PRIMARY_KEY);setConfirmed(true);}} style={{padding:"4px 10px",borderRadius:7,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:11}}>⏏ API Key</button>
       </div>
 
       <div style={{display:"flex",flex:1,overflow:"hidden"}}>
@@ -840,7 +867,7 @@ export default function FinanceMVP() {
               </div>
               <div style={{padding:"14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div><div style={{fontSize:13}}>API Key ändern</div><div style={{color:C.muted,fontSize:11,marginTop:2}}>Alpha Vantage Key</div></div>
-                <button className="btn" onClick={()=>{LS.del("apiKey");setConfirmed(false);setApiKey("");}} style={{padding:"6px 14px",borderRadius:8,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:12}}>⏏ Abmelden</button>
+                <button className="btn" onClick={()=>{LS.del("apiKey");setApiKey(EMBEDDED_AV_PRIMARY_KEY);setConfirmed(true);}} style={{padding:"6px 14px",borderRadius:8,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:12}}>⏏ Abmelden</button>
               </div>
             </div>
             <div style={{marginTop:16,color:C.muted,fontSize:10,textAlign:"center"}}>MARKET·LENS · Alpha Vantage · Free: 25 req/Tag</div>

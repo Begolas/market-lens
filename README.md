@@ -37,9 +37,9 @@
 
 ### Schritt 4 – App benutzen
 
-1. App öffnen → Alpha Vantage API-Key eingeben
-2. Kostenloser Key: **alphavantage.co/support/#api-key** (sofort, kein Warten)
-3. Free Tier: 25 Anfragen/Tag, 5 Anfragen/Minute
+1. App öffnen → Key ist bereits im MVP hinterlegt (kein Start-Prompt)
+2. Optional kannst du lokal einen eigenen Key in der App setzen (localStorage `apiKey`)
+3. Free Tier: 25 Anfragen/Tag, 5 Anfragen/Minute (Fallback-Key wird bei Limit genutzt)
 
 ---
 
