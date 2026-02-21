@@ -1,0 +1,26 @@
+{
+  "short_name": "MARKET·LENS",
+  "name": "MARKET·LENS – Finanzmarkt-Client",
+  "description": "Live-Kurse, Candlestick-Charts, Indikatoren (Alpha Vantage)",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#060b11",
+  "background_color": "#060b11",
+  "categories": ["finance", "utilities"],
+  "lang": "de"
+}

@@ -1,1 +1,46 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#060b11" />
+  <meta name="description" content="MARKET·LENS – Finanzmarkt-Client mit Live-Kursen, Charts und Indikatoren" />
 
+  <!-- PWA / iOS -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="MARKET·LENS" />
+  <meta name="mobile-web-app-capable" content="yes" />
+
+  <!-- iOS Splash Screens (iPhone 14 Pro / 15) -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+  <!-- Icons -->
+  <link rel="apple-touch-icon" href="%PUBLIC_URL%/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="192x192" href="%PUBLIC_URL%/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="%PUBLIC_URL%/icon-512.png" />
+  <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+
+  <title>MARKET·LENS</title>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root {
+      height: 100%;
+      background: #060b11;
+      overscroll-behavior: none;
+    }
+    body {
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    /* Prevent iOS bounce scroll on root */
+    body { overflow: hidden; position: fixed; width: 100%; }
+    #root { overflow: auto; -webkit-overflow-scrolling: touch; }
+  </style>
+</head>
+<body>
+  <noscript>JavaScript wird benötigt.</noscript>
+  <div id="root"></div>
+</body>
+</html>
