@@ -94,8 +94,11 @@ function isRetryableAvError(err) {
   return /Rate-Limit|Free-Tier-Limit|calls per minute|calls per day|Nicht verfügbar im Free-Tier|premium|subscription/i.test(m);
 }
 
-async function avFetchWithFallback(makeParams, preferredKey, budgetOpts = {}) {
-  const keys = [EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY, preferredKey].filter(Boolean).filter((k, i, a) => a.indexOf(k) === i);
+async function avFetchWithFallback(makeParams, preferredKey, budgetOpts = {}, extraKeys = []) {
+  const keys = [EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY, ...extraKeys, preferredKey]
+    .map((k) => (k || "").trim())
+    .filter(Boolean)
+    .filter((k, i, a) => a.indexOf(k) === i);
   let lastErr = null;
   for (const key of keys) {
     try {
@@ -138,7 +141,7 @@ function aggregateCandles(daily, mode) {
   return [...by.values()].sort((a, b) => a.date - b.date);
 }
 
-async function fetchCandles(symbol, interval, apiKey, { force = false } = {}) {
+async function fetchCandles(symbol, interval, apiKey, { force = false, extraKeys = [] } = {}) {
   const key = `candles:${symbol}:daily`;
   const now = Date.now();
   const hit = await idb.get(idb.stores.candles, key);
@@ -149,7 +152,8 @@ async function fetchCandles(symbol, interval, apiKey, { force = false } = {}) {
   const data = await avFetchWithFallback(
     (k) => ({ ...AV_FREE_ENDPOINTS.DAILY, symbol, apikey: k }),
     apiKey,
-    { critical: true }
+    { critical: true },
+    extraKeys
   );
   const tsKey = Object.keys(data).find((k) => k.startsWith("Time Series"));
   if (!tsKey) throw new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen.");
@@ -168,24 +172,39 @@ async function fetchCandles(symbol, interval, apiKey, { force = false } = {}) {
   return aggregateCandles(daily, interval);
 }
 
-async function loadSymbolIndex(apiKey, { force = false } = {}) {
+async function loadSymbolIndex(apiKey, { force = false, extraKeys = [] } = {}) {
   const key = "symbolIndex";
   const hit = await idb.get(idb.stores.symbols, key);
   const now = Date.now();
   if (!force && hit?.updatedAt && now - hit.updatedAt < SYMBOL_INDEX_TTL && hit.data?.length) return hit.data;
 
-  await takeApiBudget({ critical: false });
-  const r = await fetch(AV + "?" + new URLSearchParams({ ...AV_FREE_ENDPOINTS.LISTING_STATUS, apikey: apiKey || EMBEDDED_AV_PRIMARY_KEY }));
-  if (!r.ok) throw new Error("Symbolindex konnte nicht geladen werden.");
-  const raw = await r.text();
+  const keys = [EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY, ...(extraKeys || []), apiKey]
+    .map((k) => (k || "").trim())
+    .filter(Boolean)
+    .filter((k, i, a) => a.indexOf(k) === i);
+
+  let raw = "";
+  let loaded = false;
+  for (const k of keys) {
+    await takeApiBudget({ critical: false });
+    const r = await fetch(AV + "?" + new URLSearchParams({ ...AV_FREE_ENDPOINTS.LISTING_STATUS, apikey: k }));
+    if (!r.ok) continue;
+    const txt = await r.text();
+    if (/^symbol,name,exchange,assetType,/i.test(txt)) {
+      raw = txt;
+      loaded = true;
+      break;
+    }
+  }
+  if (!loaded) throw new Error("Symbolindex konnte nicht geladen werden.");
   const rows = raw.split("\n").slice(1).map((line) => line.split(",")).filter((x) => x.length > 7 && x[6] === "active");
   const cleaned = rows.slice(0, 8000).map((x) => ({ symbol: x[0], name: x[1], type: x[2], region: x[3], currency: x[7] || "USD" }));
   await idb.set(idb.stores.symbols, { key, updatedAt: now, data: cleaned });
   return cleaned;
 }
 
-async function searchSymbolsRemote(q, apiKey) {
-  const data = await avFetchWithFallback((k) => ({ ...AV_FREE_ENDPOINTS.SYMBOL_SEARCH, keywords: q, apikey: k }), apiKey, { critical: false });
+async function searchSymbolsRemote(q, apiKey, extraKeys = []) {
+  const data = await avFetchWithFallback((k) => ({ ...AV_FREE_ENDPOINTS.SYMBOL_SEARCH, keywords: q, apikey: k }), apiKey, { critical: false }, extraKeys);
   return (data.bestMatches || []).map((m) => ({ symbol: m["1. symbol"], name: m["2. name"], type: m["3. type"], region: m["4. region"], currency: m["8. currency"] }));
 }
 
@@ -460,10 +479,29 @@ function IndPill({ id, active, onToggle, small }) {
 export default function FinanceMVP() {
   const isMobile = useIsMobile();
 
-  // API Key
+  // API Keys
   const [apiKey,    setApiKey]    = useState(()=>LS.raw("apiKey")||EMBEDDED_AV_PRIMARY_KEY);
+  const [apiKeys,   setApiKeys]   = useState(()=>LS.raw("apiKeys")||[]);
   const [keyInput,  setKeyInput]  = useState("");
   const [confirmed, setConfirmed] = useState(true);
+
+  const addApiKey = useCallback((raw) => {
+    const k = String(raw || "").trim();
+    if (!k) return;
+    setApiKeys((prev) => {
+      const next = [...prev, k].filter((v, i, a) => a.indexOf(v) === i);
+      LS.raw("apiKeys", next);
+      return next;
+    });
+  }, []);
+
+  const removeApiKey = useCallback((k) => {
+    setApiKeys((prev) => {
+      const next = prev.filter((x) => x !== k);
+      LS.raw("apiKeys", next);
+      return next;
+    });
+  }, []);
 
   // Layout (persisted)
   const [layout, setLayout] = useState(() => {
@@ -525,9 +563,9 @@ export default function FinanceMVP() {
 
   useEffect(() => {
     if (!confirmed || !apiKey) return;
-    loadCandles(symbol, layout.timeRange, apiKey);
+    loadCandles(symbol, layout.timeRange, apiKey, { extraKeys: apiKeys });
     readBudget().then(setBudgetInfo).catch(() => {});
-  }, [symbol, layout.timeRange, confirmed, apiKey, loadCandles]);
+  }, [symbol, layout.timeRange, confirmed, apiKey, apiKeys, loadCandles]);
 
   // Local-first search
   useEffect(() => {
@@ -548,7 +586,7 @@ export default function FinanceMVP() {
   const fetchSymbolIndexManual = async () => {
     setSearching(true);
     try {
-      const list = await loadSymbolIndex(apiKey);
+      const list = await loadSymbolIndex(apiKey, { extraKeys: apiKeys });
       setSymbolIndex(list);
       setSearchRes(list.slice(0, 20));
       const b = await readBudget();
@@ -564,7 +602,7 @@ export default function FinanceMVP() {
     if (searchQ.trim().length < 2) return;
     setSearching(true);
     try {
-      const remote = await searchSymbolsRemote(searchQ, apiKey);
+      const remote = await searchSymbolsRemote(searchQ, apiKey, apiKeys);
       setSearchRes(remote);
       const b = await readBudget();
       setBudgetInfo(b);
@@ -667,6 +705,7 @@ export default function FinanceMVP() {
           {[["candle","🕯 Kerze"],["line","📈 Linie"]].map(([t,l])=><button key={t} className="btn" onClick={()=>updateLayout({chartType:t})} style={{padding:"3px 10px",borderRadius:5,background:layout.chartType===t?"#1e2a40":"transparent",color:layout.chartType===t?C.text:C.muted,fontSize:11}}>{l}</button>)}
         </div>
         <button className="btn" onClick={resetLayout} style={{padding:"4px 10px",borderRadius:7,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>↺ Reset</button>
+        <button className="btn" onClick={()=>{const k=window.prompt("Neuen Alpha Vantage API Key eingeben"); if(k){addApiKey(k);}}} style={{padding:"4px 10px",borderRadius:7,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>＋ Key</button>
         <button className="btn" onClick={()=>{LS.del("apiKey");setApiKey(EMBEDDED_AV_PRIMARY_KEY);setConfirmed(true);}} style={{padding:"4px 10px",borderRadius:7,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:11}}>⏏ API Key</button>
       </div>
 
@@ -714,7 +753,7 @@ export default function FinanceMVP() {
               <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:26,letterSpacing:1}}>{stats.last.toFixed(stats.last>=1000?0:2)}<span style={{fontSize:13,color:C.muted,marginLeft:6}}>{symMeta?.currency||""}</span></div>
               <div style={{color:stats.isUp?C.up:C.down,fontSize:13}}>{stats.isUp?"▲":"▼"} {Math.abs(stats.chg).toFixed(2)} ({stats.isUp?"+":""}{stats.pct.toFixed(2)}%)</div>
             </div>}
-            <button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{force:true})} style={{padding:"5px 10px",borderRadius:8,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:12}}>↻ Refresh</button>
+            <button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{force:true,extraKeys:apiKeys})} style={{padding:"5px 10px",borderRadius:8,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:12}}>↻ Refresh</button>
             <button className="btn" onClick={()=>favorites.includes(symbol)?saveFavs(favorites.filter(f=>f!==symbol)):saveFavs([...favorites,symbol])}
               style={{padding:"5px 12px",borderRadius:8,background:favorites.includes(symbol)?"#162018":C.card,border:"1px solid "+(favorites.includes(symbol)?"#22d3a540":C.border),color:favorites.includes(symbol)?C.up:C.muted,fontSize:12}}>
               {favorites.includes(symbol)?"★ Gespeichert":"☆ Favorit"}
@@ -737,7 +776,7 @@ export default function FinanceMVP() {
           {/* Chart */}
           <div style={{padding:"0 16px 8px",flexShrink:0}}>
             {loading&&<div style={{height:280,display:"flex",alignItems:"center",justifyContent:"center",color:C.muted,fontSize:12}}>Lade Marktdaten …</div>}
-            {error&&<div style={{height:200,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10}}><div style={{color:C.down,fontSize:13}}>⚠ {error}</div><button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey)} style={{padding:"5px 14px",background:C.card,border:"1px solid "+C.border,borderRadius:7,color:C.muted,fontSize:12}}>Erneut versuchen</button></div>}
+            {error&&<div style={{height:200,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10}}><div style={{color:C.down,fontSize:13}}>⚠ {error}</div><button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{extraKeys:apiKeys})} style={{padding:"5px 14px",background:C.card,border:"1px solid "+C.border,borderRadius:7,color:C.muted,fontSize:12}}>Erneut versuchen</button></div>}
             {!loading&&!error&&candles.length>0&&(
               <div style={{background:C.panel,borderRadius:12,border:"1px solid "+C.border,overflow:"hidden"}} className="fade">
                 <CandleChart data={candles} layout={layout} isMobile={false}/>
@@ -846,7 +885,7 @@ export default function FinanceMVP() {
           <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:20,letterSpacing:0.5}}>{stats.last.toFixed(stats.last>=1000?0:2)}</div>
           <div style={{color:stats.isUp?C.up:C.down,fontSize:12}}>{stats.isUp?"▲":"▼"} {Math.abs(stats.pct).toFixed(2)}%</div>
         </div>}
-        <button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{force:true})} style={{padding:"6px 8px",borderRadius:8,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:12}}>↻</button>
+        <button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{force:true,extraKeys:apiKeys})} style={{padding:"6px 8px",borderRadius:8,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:12}}>↻</button>
         <button className="btn" onClick={()=>favorites.includes(symbol)?saveFavs(favorites.filter(f=>f!==symbol)):saveFavs([...favorites,symbol])}
           style={{padding:"6px 10px",borderRadius:8,background:favorites.includes(symbol)?"#162018":C.card,border:"1px solid "+(favorites.includes(symbol)?"#22d3a540":C.border),color:favorites.includes(symbol)?C.up:C.muted,fontSize:16}}>
           {favorites.includes(symbol)?"★":"☆"}
@@ -873,7 +912,7 @@ export default function FinanceMVP() {
 
             {/* Chart */}
             {loading&&<div style={{height:220,display:"flex",alignItems:"center",justifyContent:"center",color:C.muted,fontSize:12}}>Lade …</div>}
-            {error&&<div style={{height:160,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10,padding:16}}><div style={{color:C.down,fontSize:13,textAlign:"center"}}>⚠ {error}</div><button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey)} style={{padding:"6px 14px",background:C.card,border:"1px solid "+C.border,borderRadius:7,color:C.muted,fontSize:12}}>Erneut versuchen</button></div>}
+            {error&&<div style={{height:160,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10,padding:16}}><div style={{color:C.down,fontSize:13,textAlign:"center"}}>⚠ {error}</div><button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{extraKeys:apiKeys})} style={{padding:"6px 14px",background:C.card,border:"1px solid "+C.border,borderRadius:7,color:C.muted,fontSize:12}}>Erneut versuchen</button></div>}
             {!loading&&!error&&candles.length>0&&(
               <div style={{background:C.panel,margin:"10px 10px 0",borderRadius:10,border:"1px solid "+C.border,overflow:"hidden"}}>
                 <CandleChart data={candles} layout={layout} isMobile={true}/>
@@ -1006,9 +1045,22 @@ export default function FinanceMVP() {
                 <div><div style={{fontSize:13}}>Cache leeren</div><div style={{color:C.muted,fontSize:11,marginTop:2}}>Gespeicherte Kursdaten löschen</div></div>
                 <button className="btn" onClick={async()=>{await idb.clear(idb.stores.candles); await idb.del(idb.stores.symbols,"symbolIndex"); setSymbolIndex([]); Object.keys(localStorage).filter(k=>k.startsWith("av_")).forEach(k=>localStorage.removeItem(k)); alert("Cache geleert!");}} style={{padding:"6px 14px",borderRadius:8,background:"#1a2030",border:"1px solid "+C.border,color:C.muted,fontSize:12}}>🗑 Leeren</button>
               </div>
-              <div style={{padding:"14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div><div style={{fontSize:13}}>API Key ändern</div><div style={{color:C.muted,fontSize:11,marginTop:2}}>Alpha Vantage Key</div></div>
-                <button className="btn" onClick={()=>{LS.del("apiKey");setApiKey(EMBEDDED_AV_PRIMARY_KEY);setConfirmed(true);}} style={{padding:"6px 14px",borderRadius:8,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:12}}>⏏ Abmelden</button>
+              <div style={{padding:"14px",borderTop:"1px solid "+C.border}}>
+                <div style={{fontSize:13,marginBottom:8}}>Weitere API Keys</div>
+                <div style={{color:C.muted,fontSize:11,marginBottom:8}}>Keys werden lokal gespeichert und als Fallback genutzt.</div>
+                <div style={{display:"flex",gap:8,marginBottom:8}}>
+                  <input value={keyInput} onChange={e=>setKeyInput(e.target.value)} placeholder="Neuen Key einfügen" style={{flex:1,background:"#0d1520",border:"1px solid "+C.border2,borderRadius:8,color:C.text,padding:"7px 10px",fontFamily:"inherit",fontSize:12,outline:"none"}} />
+                  <button className="btn" onClick={()=>{if(!keyInput.trim())return;addApiKey(keyInput);setKeyInput("");}} style={{padding:"7px 10px",borderRadius:8,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:12}}>＋</button>
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:120,overflowY:"auto"}}>
+                  {apiKeys.length===0 && <div style={{color:C.muted,fontSize:11}}>Keine zusätzlichen Keys gespeichert.</div>}
+                  {apiKeys.map((k)=> (
+                    <div key={k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:C.card,border:"1px solid "+C.border,borderRadius:8,padding:"6px 8px"}}>
+                      <span style={{fontSize:11,color:C.text}}>{k.slice(0,8)}…{k.slice(-4)}</span>
+                      <button className="btn" onClick={()=>removeApiKey(k)} style={{padding:"4px 8px",borderRadius:6,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:11}}>Entfernen</button>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
             <div style={{marginTop:16,color:C.muted,fontSize:10,textAlign:"center"}}>MARKET·LENS · Alpha Vantage · Free: 25 req/Tag</div>

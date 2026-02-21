@@ -30,6 +30,12 @@ npm start
   - Warnungen bei Schwellwerten
   - nicht-kritische Calls bei **25/25** blockiert.
 
+## API-Key Fallbacks
+
+- Standardmäßig nutzt die App eingebettete Keys für den Free-Tier-Betrieb.
+- In den Einstellungen kannst du zusätzliche Alpha-Vantage-Keys lokal speichern.
+- Zusätzliche Keys werden als Fallback-Rotation genutzt, um Ausfälle bei Limits zu reduzieren.
+
 ## Deployment Update
 
 Änderungen pushen → Vercel deployed automatisch neu.
