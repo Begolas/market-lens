@@ -154,12 +154,37 @@ async function fetchCandles(symbol, interval, apiKey, { force = false, extraKeys
     return aggregateCandles(deserializeCandles(hit.data), interval);
   }
 
-  const data = await avFetchWithFallback(
-    (k) => ({ ...AV_FREE_ENDPOINTS.DAILY, symbol, apikey: k }),
-    apiKey,
-    { critical: true },
-    extraKeys
-  );
+  const keys = [EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY, ...(extraKeys || []), apiKey]
+    .map((k) => (k || "").trim())
+    .filter(Boolean)
+    .filter((k, i, a) => a.indexOf(k) === i);
+
+  let data = null;
+  let lastErr = null;
+  for (const k of keys) {
+    try {
+      await takeApiBudget({ critical: true });
+      const r = await fetch(AV + "?" + new URLSearchParams({ ...AV_FREE_ENDPOINTS.DAILY, symbol, apikey: k }));
+      if (!r.ok) {
+        lastErr = new Error("HTTP " + r.status);
+        continue;
+      }
+      const json = await r.json();
+      const tsKeyCandidate = Object.keys(json || {}).find((x) => x.startsWith("Time Series"));
+      if (tsKeyCandidate) {
+        data = json;
+        break;
+      }
+      const normalized = normalizeAvError(json, "TIME_SERIES_DAILY");
+      lastErr = new Error(normalized || "Keine Daily-Daten in API-Antwort.");
+      // nächster Key
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  if (!data) throw (lastErr || new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen."));
+
   const tsKey = Object.keys(data).find((k) => k.startsWith("Time Series"));
   if (!tsKey) throw new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen.");
 
