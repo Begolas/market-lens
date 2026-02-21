@@ -5,9 +5,14 @@ import App from './App';
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(<React.StrictMode><App /></React.StrictMode>);
 
-// Service Worker für PWA (Offline-Cache)
+// Hotfix: disable old SW cache path to avoid stale app bundles blocking data fixes.
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
-  });
+  navigator.serviceWorker.getRegistrations().then((regs) => {
+    regs.forEach((r) => r.unregister());
+  }).catch(() => {});
+}
+if ('caches' in window) {
+  caches.keys().then((keys) => {
+    keys.filter((k) => k.startsWith('market-lens-')).forEach((k) => caches.delete(k));
+  }).catch(() => {});
 }
