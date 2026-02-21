@@ -1,23 +1,28 @@
 # Alpha Vantage Free Tier Notes (MVP)
 
-## Endpoints used in this app
-- `SYMBOL_SEARCH` — symbol lookup
-- `TIME_SERIES_DAILY` (`outputsize=compact`) — default candle source (`1D`)
-- `TIME_SERIES_WEEKLY` — weekly candles (`1W`)
-- `TIME_SERIES_MONTHLY` — monthly candles (`1Mo`)
+## Endpoints used
+- `TIME_SERIES_DAILY` (`outputsize=compact`) — **einzige** Candle-Quelle
+- `LISTING_STATUS` — optionaler Symbol-Index (manuell)
+- `SYMBOL_SEARCH` — nur manueller Fallback
 
-## Explicitly not used
-- Intraday endpoints (e.g. `TIME_SERIES_INTRADAY`)
-- Adjusted/premium-only flows in this MVP
-- Premium technical indicator endpoints (`SMA`, `EMA`, `RSI`, `MACD`, etc.)
+## Not used
+- `TIME_SERIES_WEEKLY` / `TIME_SERIES_MONTHLY` (werden lokal aus Daily aggregiert)
+- Intraday / adjusted / premium indicator endpoints
 
-## Indicator behavior
-All chart indicators in MARKET·LENS are computed client-side from OHLCV candles (local TA functions), not fetched as premium indicator API endpoints.
+## Local computation
+- SMA/EMA/BB/VWAP/Ichimoku/Fibonacci/RSI/MACD komplett client-seitig
+- `1W` / `1Mo` lokal aus Daily aggregiert
 
-## Limits handled
-- Free tier: **5 requests/minute**, **25 requests/day**
-- App normalizes Alpha Vantage `Note` responses and shows a clear rate-limit message.
+## Cache & persistence
+- IndexedDB Stores:
+  - `candles` (daily series je Symbol)
+  - `symbols` (lokaler Symbol-Index)
+  - `meta` (Request-Budget: `callsToday`, `date`, Warnstatus)
+- Candle TTL: **12h**
+- Symbol-Index TTL: **7 Tage**
 
-## Safety defaults
-- Time ranges are constrained to `1D`, `1W`, `1Mo`
-- Unknown/stale range values fallback to `1D`
+## Budget behavior (25/day)
+- Tagesbudget lokal gezählt
+- Warnung bei hohen Ständen
+- nicht-kritische Calls bei 25/25 blockiert
+- kein Auto-Refresh-Loop; nur manuell (↻) oder bei notwendigem Symbolwechsel

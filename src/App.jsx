@@ -10,13 +10,50 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 ═══════════════════════════════════════════════════════════════════ */
 
 // ─── Storage ─────────────────────────────────────────────────────
-const CACHE_TTL = 15 * 60 * 1000;
+import { idb } from "./idbStore";
+
+const CANDLE_TTL = 12 * 60 * 60 * 1000;
+const SYMBOL_INDEX_TTL = 7 * 24 * 60 * 60 * 1000;
+const REQUEST_LIMIT_DAY = 25;
+const REQUEST_WARN_AT = [15, 20, 24];
+
 const LS = {
-  get:  (k)    => { try { const r = JSON.parse(localStorage.getItem(k)); return r && (!r._ts || Date.now()-r._ts < CACHE_TTL) ? r.v : null; } catch { return null; } },
-  set:  (k, v) => { try { localStorage.setItem(k, JSON.stringify({ v, _ts: Date.now() })); } catch {} },
-  raw:  (k, v) => { if (v===undefined) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } } try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
-  del:  (k)    => { try { localStorage.removeItem(k); } catch {} },
+  get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  raw: (k, v) => { if (v === undefined) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } } try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del: (k) => { try { localStorage.removeItem(k); } catch {} },
 };
+
+const dayStamp = () => new Date().toISOString().slice(0, 10);
+
+async function readBudget() {
+  const key = "requestBudget";
+  const currentDay = dayStamp();
+  const hit = await idb.get(idb.stores.meta, key);
+  if (hit?.date === currentDay) return hit;
+  const fresh = { key, date: currentDay, callsToday: 0, warned: [] };
+  await idb.set(idb.stores.meta, fresh);
+  return fresh;
+}
+
+async function takeApiBudget({ critical = false } = {}) {
+  const budget = await readBudget();
+  if (budget.callsToday >= REQUEST_LIMIT_DAY && !critical) {
+    throw new Error("Tageslimit erreicht (25/25). Nicht-kritische Anfrage blockiert.");
+  }
+  const next = { ...budget, callsToday: budget.callsToday + 1 };
+  await idb.set(idb.stores.meta, next);
+  return next;
+}
+
+async function maybeBudgetWarning() {
+  const budget = await readBudget();
+  const at = REQUEST_WARN_AT.find((n) => budget.callsToday >= n && !(budget.warned || []).includes(n));
+  if (!at) return null;
+  const warned = [...(budget.warned || []), at];
+  await idb.set(idb.stores.meta, { ...budget, warned });
+  return `API-Budget: ${budget.callsToday}/${REQUEST_LIMIT_DAY} Anfragen heute.`;
+}
 
 // ─── Alpha Vantage (Free Tier only) ──────────────────────────────
 const AV = "https://www.alphavantage.co/query";
@@ -24,11 +61,8 @@ const EMBEDDED_AV_PRIMARY_KEY = "PBGV8GAJ362XPAY6";
 const EMBEDDED_AV_FALLBACK_KEY = "16QCQ1L3KRI9DOM5";
 const AV_FREE_ENDPOINTS = {
   SYMBOL_SEARCH: { function: "SYMBOL_SEARCH" },
-  CANDLES: {
-    "1D": { function: "TIME_SERIES_DAILY", outputsize: "compact" },
-    "1W": { function: "TIME_SERIES_WEEKLY" },
-    "1Mo": { function: "TIME_SERIES_MONTHLY" },
-  },
+  LISTING_STATUS: { function: "LISTING_STATUS" },
+  DAILY: { function: "TIME_SERIES_DAILY", outputsize: "compact" },
 };
 
 function normalizeAvError(data) {
@@ -40,14 +74,13 @@ function normalizeAvError(data) {
     }
     return "Alpha Vantage Hinweis: Anfrage aktuell nicht verfügbar (Free-Tier-Limit).";
   }
-  if (info && /premium|subscription/i.test(info)) {
-    return "Nicht verfügbar im Free-Tier. Bitte nur Tages-/Wochen-/Monatsdaten nutzen.";
-  }
+  if (info && /premium|subscription/i.test(info)) return "Nicht verfügbar im Free-Tier.";
   if (data?.["Error Message"]) return "Symbol nicht gefunden oder Anfrage ungültig.";
   return null;
 }
 
-async function avFetch(params) {
+async function avFetch(params, budgetOpts = {}) {
+  await takeApiBudget(budgetOpts);
   const r = await fetch(AV + "?" + new URLSearchParams(params));
   if (!r.ok) throw new Error("HTTP " + r.status);
   const data = await r.json();
@@ -61,15 +94,12 @@ function isRetryableAvError(err) {
   return /Rate-Limit|Free-Tier-Limit|calls per minute|calls per day|Nicht verfügbar im Free-Tier|premium|subscription/i.test(m);
 }
 
-async function avFetchWithFallback(makeParams, preferredKey) {
-  const keys = [EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY, preferredKey]
-    .filter(Boolean)
-    .filter((k, i, a) => a.indexOf(k) === i);
-
+async function avFetchWithFallback(makeParams, preferredKey, budgetOpts = {}) {
+  const keys = [EMBEDDED_AV_PRIMARY_KEY, EMBEDDED_AV_FALLBACK_KEY, preferredKey].filter(Boolean).filter((k, i, a) => a.indexOf(k) === i);
   let lastErr = null;
   for (const key of keys) {
     try {
-      return await avFetch(makeParams(key));
+      return await avFetch(makeParams(key), budgetOpts);
     } catch (e) {
       lastErr = e;
       if (!isRetryableAvError(e)) throw e;
@@ -78,22 +108,53 @@ async function avFetchWithFallback(makeParams, preferredKey) {
   throw lastErr || new Error("Alpha Vantage Anfrage fehlgeschlagen.");
 }
 
-function getFreeCandleParams(symbol, interval, apiKey) {
-  const safeInterval = AV_FREE_ENDPOINTS.CANDLES[interval] ? interval : "1D";
-  return { ...AV_FREE_ENDPOINTS.CANDLES[safeInterval], symbol, apikey: apiKey };
+function serializeCandles(candles) {
+  return candles.map((c) => ({ ...c, date: c.date.toISOString() }));
 }
 
-async function fetchCandles(symbol, interval, apiKey) {
-  const safeInterval = AV_FREE_ENDPOINTS.CANDLES[interval] ? interval : "1D";
-  const key = "av_" + symbol + "_" + safeInterval;
-  const hit = LS.get(key);
-  if (hit) return hit.map(c => ({ ...c, date: new Date(c.date) }));
+function deserializeCandles(candles) {
+  return (candles || []).map((c) => ({ ...c, date: new Date(c.date) }));
+}
 
-  const data = await avFetchWithFallback((key) => getFreeCandleParams(symbol, safeInterval, key), apiKey);
-  const tsKey = Object.keys(data).find(k => k.startsWith("Time Series"));
+function aggregateCandles(daily, mode) {
+  if (mode === "1D") return daily;
+  const by = new Map();
+  for (const c of daily) {
+    const d = c.date;
+    const key = mode === "1W"
+      ? `${d.getUTCFullYear()}-${String(Math.floor((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - Date.UTC(d.getUTCFullYear(), 0, 1)) / 86400000 / 7)).padStart(2, "0")}`
+      : `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+    const prev = by.get(key);
+    if (!prev) by.set(key, { ...c });
+    else by.set(key, {
+      ...prev,
+      high: Math.max(prev.high, c.high),
+      low: Math.min(prev.low, c.low),
+      close: c.close,
+      volume: prev.volume + c.volume,
+      date: c.date,
+    });
+  }
+  return [...by.values()].sort((a, b) => a.date - b.date);
+}
+
+async function fetchCandles(symbol, interval, apiKey, { force = false } = {}) {
+  const key = `candles:${symbol}:daily`;
+  const now = Date.now();
+  const hit = await idb.get(idb.stores.candles, key);
+  if (!force && hit?.updatedAt && now - hit.updatedAt < CANDLE_TTL && hit.data?.length) {
+    return aggregateCandles(deserializeCandles(hit.data), interval);
+  }
+
+  const data = await avFetchWithFallback(
+    (k) => ({ ...AV_FREE_ENDPOINTS.DAILY, symbol, apikey: k }),
+    apiKey,
+    { critical: true }
+  );
+  const tsKey = Object.keys(data).find((k) => k.startsWith("Time Series"));
   if (!tsKey) throw new Error("Keine Marktdaten erhalten (Free-Tier Endpoint). Bitte später erneut versuchen.");
 
-  const candles = Object.entries(data[tsKey]).map(([date, v]) => ({
+  const daily = Object.entries(data[tsKey]).map(([date, v]) => ({
     date: new Date(date),
     open: parseFloat(v["1. open"]),
     high: parseFloat(v["2. high"]),
@@ -102,16 +163,30 @@ async function fetchCandles(symbol, interval, apiKey) {
     volume: parseInt(v["5. volume"] || "0", 10),
   })).sort((a, b) => a.date - b.date);
 
-  LS.set(key, candles.map(c => ({ ...c, date: c.date.toISOString() })));
-  return candles;
+  await idb.set(idb.stores.candles, { key, updatedAt: now, data: serializeCandles(daily) });
+  LS.set("av_" + symbol + "_1D", daily.map((c) => ({ ...c, date: c.date.toISOString() })));
+  return aggregateCandles(daily, interval);
 }
 
-async function searchSymbols(q, apiKey) {
-  const data = await avFetchWithFallback(
-    (key) => ({ ...AV_FREE_ENDPOINTS.SYMBOL_SEARCH, keywords: q, apikey: key }),
-    apiKey
-  );
-  return (data.bestMatches || []).map(m => ({ symbol: m["1. symbol"], name: m["2. name"], type: m["3. type"], region: m["4. region"], currency: m["8. currency"] }));
+async function loadSymbolIndex(apiKey, { force = false } = {}) {
+  const key = "symbolIndex";
+  const hit = await idb.get(idb.stores.symbols, key);
+  const now = Date.now();
+  if (!force && hit?.updatedAt && now - hit.updatedAt < SYMBOL_INDEX_TTL && hit.data?.length) return hit.data;
+
+  await takeApiBudget({ critical: false });
+  const r = await fetch(AV + "?" + new URLSearchParams({ ...AV_FREE_ENDPOINTS.LISTING_STATUS, apikey: apiKey || EMBEDDED_AV_PRIMARY_KEY }));
+  if (!r.ok) throw new Error("Symbolindex konnte nicht geladen werden.");
+  const raw = await r.text();
+  const rows = raw.split("\n").slice(1).map((line) => line.split(",")).filter((x) => x.length > 7 && x[6] === "active");
+  const cleaned = rows.slice(0, 8000).map((x) => ({ symbol: x[0], name: x[1], type: x[2], region: x[3], currency: x[7] || "USD" }));
+  await idb.set(idb.stores.symbols, { key, updatedAt: now, data: cleaned });
+  return cleaned;
+}
+
+async function searchSymbolsRemote(q, apiKey) {
+  const data = await avFetchWithFallback((k) => ({ ...AV_FREE_ENDPOINTS.SYMBOL_SEARCH, keywords: q, apikey: k }), apiKey, { critical: false });
+  return (data.bestMatches || []).map((m) => ({ symbol: m["1. symbol"], name: m["2. name"], type: m["3. type"], region: m["4. region"], currency: m["8. currency"] }));
 }
 
 // ─── TA ───────────────────────────────────────────────────────────
@@ -414,12 +489,16 @@ export default function FinanceMVP() {
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState(null);
 
-  // Search
+  // Search + local index
   const [searchQ,    setSearchQ]    = useState("");
   const [searchRes,  setSearchRes]  = useState([]);
   const [searching,  setSearching]  = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  const searchTimer = useRef(null);
+  const [symbolIndex, setSymbolIndex] = useState([]);
+
+  // Budget
+  const [budgetInfo, setBudgetInfo] = useState(null);
+  const [budgetWarn, setBudgetWarn] = useState(null);
 
   // Mobile nav
   const [mobileTab, setMobileTab] = useState("chart"); // chart | watchlist | indicators | settings
@@ -429,25 +508,72 @@ export default function FinanceMVP() {
   const ROWS=15;
 
   // Load candles
-  const loadCandles = useCallback(async (sym, interval, key) => {
+  const loadCandles = useCallback(async (sym, interval, key, opts = {}) => {
     if (!key) return;
     setLoading(true); setError(null); setTablePage(0);
     try {
-      const raw = await fetchCandles(sym, interval, key);
+      const raw = await fetchCandles(sym, interval, key, opts);
       setCandles(raw);
       LS.raw("lastSymbol", sym);
+      const b = await readBudget();
+      setBudgetInfo(b);
+      const warn = await maybeBudgetWarning();
+      if (warn) setBudgetWarn(warn);
     } catch(e) { setError(e.message); }
     finally { setLoading(false); }
   }, []);
 
-  useEffect(()=>{ if (confirmed&&apiKey) loadCandles(symbol,layout.timeRange,apiKey); },[symbol,layout.timeRange,confirmed]);
+  useEffect(() => {
+    if (!confirmed || !apiKey) return;
+    loadCandles(symbol, layout.timeRange, apiKey);
+    readBudget().then(setBudgetInfo).catch(() => {});
+  }, [symbol, layout.timeRange, confirmed, apiKey, loadCandles]);
 
-  // Search
-  useEffect(()=>{
-    if (!searchQ.trim()||searchQ.length<2) { setSearchRes([]); return; }
-    clearTimeout(searchTimer.current);
-    searchTimer.current=setTimeout(async()=>{ setSearching(true); try { setSearchRes(await searchSymbols(searchQ,apiKey)); } catch{} setSearching(false); },420);
-  },[searchQ]);
+  // Local-first search
+  useEffect(() => {
+    const q = searchQ.trim().toLowerCase();
+    if (q.length < 2) { setSearchRes([]); return; }
+    const local = symbolIndex.filter((s) =>
+      s.symbol?.toLowerCase().includes(q) || s.name?.toLowerCase().includes(q)
+    ).slice(0, 20);
+    setSearchRes(local);
+  }, [searchQ, symbolIndex]);
+
+  useEffect(() => {
+    idb.get(idb.stores.symbols, "symbolIndex").then((hit) => {
+      if (hit?.data?.length) setSymbolIndex(hit.data);
+    }).catch(() => {});
+  }, []);
+
+  const fetchSymbolIndexManual = async () => {
+    setSearching(true);
+    try {
+      const list = await loadSymbolIndex(apiKey);
+      setSymbolIndex(list);
+      setSearchRes(list.slice(0, 20));
+      const b = await readBudget();
+      setBudgetInfo(b);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const remoteSearchManual = async () => {
+    if (searchQ.trim().length < 2) return;
+    setSearching(true);
+    try {
+      const remote = await searchSymbolsRemote(searchQ, apiKey);
+      setSearchRes(remote);
+      const b = await readBudget();
+      setBudgetInfo(b);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSearching(false);
+    }
+  };
 
   // Stats
   const stats = useMemo(()=>{
@@ -512,7 +638,7 @@ export default function FinanceMVP() {
           {searching&&<span style={{position:"absolute",right:8,top:"50%",transform:"translateY(-50%)",color:C.muted,fontSize:10}}>…</span>}
           {searchOpen&&(searchRes.length>0||searchQ.length>1)&&(
             <div style={{position:"absolute",top:"calc(100% + 4px)",left:0,width:310,background:C.panel,border:"1px solid "+C.border,borderRadius:8,zIndex:200,boxShadow:"0 8px 32px #000a"}}>
-              {searchRes.length===0?<div style={{padding:"10px 14px",color:C.muted,fontSize:12}}>Keine Ergebnisse</div>
+              {searchRes.length===0?<div style={{padding:"10px 14px",color:C.muted,fontSize:12}}>Keine lokalen Treffer</div>
               :searchRes.slice(0,8).map(s=>(
                 <div key={s.symbol} onMouseDown={()=>{setSymbol(s.symbol);setSymMeta(s);setSearchQ("");setSearchOpen(false);}}
                   style={{padding:"8px 14px",cursor:"pointer",display:"flex",gap:8,alignItems:"center",borderBottom:"1px solid "+C.border}}
@@ -522,6 +648,10 @@ export default function FinanceMVP() {
                   <span style={{fontSize:10,color:C.muted,background:"#12191f",padding:"1px 6px",borderRadius:4}}>{s.type}</span>
                 </div>
               ))}
+              <div style={{display:"flex",gap:6,padding:8}}>
+                <button className="btn" onMouseDown={fetchSymbolIndexManual} style={{flex:1,padding:"5px 8px",borderRadius:6,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>Index laden</button>
+                <button className="btn" onMouseDown={remoteSearchManual} style={{flex:1,padding:"5px 8px",borderRadius:6,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>Remote Suche</button>
+              </div>
             </div>
           )}
         </div>
@@ -540,6 +670,9 @@ export default function FinanceMVP() {
         <button className="btn" onClick={()=>{LS.del("apiKey");setApiKey(EMBEDDED_AV_PRIMARY_KEY);setConfirmed(true);}} style={{padding:"4px 10px",borderRadius:7,background:"#1a0f10",border:"1px solid #3a1a1a",color:"#f87171",fontSize:11}}>⏏ API Key</button>
       </div>
 
+      {(budgetInfo || budgetWarn) && <div style={{padding:"4px 14px",fontSize:11,color:budgetInfo?.callsToday>=REQUEST_LIMIT_DAY?C.down:C.muted,borderBottom:"1px solid "+C.border,background:C.panel}}>
+        {budgetWarn || `API-Budget heute: ${budgetInfo?.callsToday || 0}/${REQUEST_LIMIT_DAY}`}
+      </div>}
       <div style={{display:"flex",flex:1,overflow:"hidden"}}>
         {/* Sidebar */}
         <div style={{width:188,borderRight:"1px solid "+C.border,display:"flex",flexDirection:"column",overflow:"hidden",flexShrink:0}}>
@@ -581,6 +714,7 @@ export default function FinanceMVP() {
               <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:26,letterSpacing:1}}>{stats.last.toFixed(stats.last>=1000?0:2)}<span style={{fontSize:13,color:C.muted,marginLeft:6}}>{symMeta?.currency||""}</span></div>
               <div style={{color:stats.isUp?C.up:C.down,fontSize:13}}>{stats.isUp?"▲":"▼"} {Math.abs(stats.chg).toFixed(2)} ({stats.isUp?"+":""}{stats.pct.toFixed(2)}%)</div>
             </div>}
+            <button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{force:true})} style={{padding:"5px 10px",borderRadius:8,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:12}}>↻ Refresh</button>
             <button className="btn" onClick={()=>favorites.includes(symbol)?saveFavs(favorites.filter(f=>f!==symbol)):saveFavs([...favorites,symbol])}
               style={{padding:"5px 12px",borderRadius:8,background:favorites.includes(symbol)?"#162018":C.card,border:"1px solid "+(favorites.includes(symbol)?"#22d3a540":C.border),color:favorites.includes(symbol)?C.up:C.muted,fontSize:12}}>
               {favorites.includes(symbol)?"★ Gespeichert":"☆ Favorit"}
@@ -684,7 +818,7 @@ export default function FinanceMVP() {
           <span style={{position:"absolute",left:7,top:"50%",transform:"translateY(-50%)",color:C.muted,fontSize:13}}>⌕</span>
           {searchOpen&&(searchRes.length>0||searchQ.length>1)&&(
             <div style={{position:"absolute",top:"calc(100% + 4px)",right:0,left:0,background:C.panel,border:"1px solid "+C.border,borderRadius:8,zIndex:300,boxShadow:"0 8px 32px #000c",minWidth:260}}>
-              {searchRes.length===0?<div style={{padding:"10px 12px",color:C.muted,fontSize:12}}>Keine Ergebnisse</div>
+              {searchRes.length===0?<div style={{padding:"10px 12px",color:C.muted,fontSize:12}}>Keine lokalen Treffer</div>
               :searchRes.slice(0,6).map(s=>(
                 <div key={s.symbol} onMouseDown={()=>{setSymbol(s.symbol);setSymMeta(s);setSearchQ("");setSearchOpen(false);setMobileTab("chart");}}
                   style={{padding:"10px 12px",cursor:"pointer",display:"flex",gap:8,alignItems:"center",borderBottom:"1px solid "+C.border}}>
@@ -692,6 +826,10 @@ export default function FinanceMVP() {
                   <span style={{color:"#8899aa",flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.name}</span>
                 </div>
               ))}
+              <div style={{display:"flex",gap:6,padding:8}}>
+                <button className="btn" onMouseDown={fetchSymbolIndexManual} style={{flex:1,padding:"6px 8px",borderRadius:6,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>Index laden</button>
+                <button className="btn" onMouseDown={remoteSearchManual} style={{flex:1,padding:"6px 8px",borderRadius:6,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:11}}>Remote</button>
+              </div>
             </div>
           )}
         </div>
@@ -708,11 +846,14 @@ export default function FinanceMVP() {
           <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:20,letterSpacing:0.5}}>{stats.last.toFixed(stats.last>=1000?0:2)}</div>
           <div style={{color:stats.isUp?C.up:C.down,fontSize:12}}>{stats.isUp?"▲":"▼"} {Math.abs(stats.pct).toFixed(2)}%</div>
         </div>}
+        <button className="btn" onClick={()=>loadCandles(symbol,layout.timeRange,apiKey,{force:true})} style={{padding:"6px 8px",borderRadius:8,background:C.card,border:"1px solid "+C.border,color:C.muted,fontSize:12}}>↻</button>
         <button className="btn" onClick={()=>favorites.includes(symbol)?saveFavs(favorites.filter(f=>f!==symbol)):saveFavs([...favorites,symbol])}
           style={{padding:"6px 10px",borderRadius:8,background:favorites.includes(symbol)?"#162018":C.card,border:"1px solid "+(favorites.includes(symbol)?"#22d3a540":C.border),color:favorites.includes(symbol)?C.up:C.muted,fontSize:16}}>
           {favorites.includes(symbol)?"★":"☆"}
         </button>
       </div>
+
+      {(budgetInfo || budgetWarn) && <div style={{padding:"4px 12px",fontSize:10,color:budgetInfo?.callsToday>=REQUEST_LIMIT_DAY?C.down:C.muted,borderBottom:"1px solid "+C.border,background:C.panel}}>{budgetWarn || `API-Budget: ${budgetInfo?.callsToday || 0}/${REQUEST_LIMIT_DAY}`}</div>}
 
       {/* Mobile Content Area */}
       <div style={{flex:1,overflowY:"auto",WebkitOverflowScrolling:"touch"}}>
@@ -863,7 +1004,7 @@ export default function FinanceMVP() {
               </div>
               <div style={{padding:"14px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div><div style={{fontSize:13}}>Cache leeren</div><div style={{color:C.muted,fontSize:11,marginTop:2}}>Gespeicherte Kursdaten löschen</div></div>
-                <button className="btn" onClick={()=>{Object.keys(localStorage).filter(k=>k.startsWith("av_")).forEach(k=>localStorage.removeItem(k));alert("Cache geleert!");}} style={{padding:"6px 14px",borderRadius:8,background:"#1a2030",border:"1px solid "+C.border,color:C.muted,fontSize:12}}>🗑 Leeren</button>
+                <button className="btn" onClick={async()=>{await idb.clear(idb.stores.candles); await idb.del(idb.stores.symbols,"symbolIndex"); setSymbolIndex([]); Object.keys(localStorage).filter(k=>k.startsWith("av_")).forEach(k=>localStorage.removeItem(k)); alert("Cache geleert!");}} style={{padding:"6px 14px",borderRadius:8,background:"#1a2030",border:"1px solid "+C.border,color:C.muted,fontSize:12}}>🗑 Leeren</button>
               </div>
               <div style={{padding:"14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div><div style={{fontSize:13}}>API Key ändern</div><div style={{color:C.muted,fontSize:11,marginTop:2}}>Alpha Vantage Key</div></div>
