@@ -90,13 +90,29 @@ function maskApiKey(key) {
 }
 
 function headerSnapshot(headers) {
-  const wanted = ["content-type", "date", "retry-after", "cache-control", "server", "via"];
+  const wanted = ["content-type", "date", "retry-after", "cache-control", "server", "via", "x-vercel-id"];
   const out = {};
   wanted.forEach((h) => {
     const v = headers?.get?.(h);
     if (v) out[h] = v;
   });
   return out;
+}
+
+async function sendClientLog(event, payload = {}) {
+  try {
+    await fetch("/api/log", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        event,
+        payload,
+        app: "market-lens",
+        ts: new Date().toISOString(),
+      }),
+      keepalive: true,
+    });
+  } catch {}
 }
 
 async function avFetch(params, budgetOpts = {}) {
@@ -611,7 +627,18 @@ export default function FinanceMVP() {
     try {
       const raw = await fetchCandles(sym, interval, key, {
         ...opts,
-        onDebug: (d) => setApiDebug((prev) => ({ ...prev, ...d, successAt: d?.successAt || prev.successAt })),
+        onDebug: (d) => {
+          setApiDebug((prev) => ({ ...prev, ...d, successAt: d?.successAt || prev.successAt }));
+          sendClientLog("av_fetch_debug", {
+            symbol: sym,
+            interval,
+            params: d?.params || null,
+            responseKeys: d?.responseKeys || [],
+            headers: d?.headers || {},
+            error: d?.error || null,
+            successAt: d?.successAt || null,
+          });
+        },
       });
       setCandles(raw);
       LS.raw("lastSymbol", sym);

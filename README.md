@@ -56,6 +56,7 @@ Erfolg sieht so aus:
 Wenn API limitiert ist:
 - API Debug zeigt `Information`/Rate-Limit-Fehler
 - bei vorhandenem Cache werden trotzdem Candle-Daten angezeigt
+- in Vercel-Logs erscheinen `av_fetch_debug` Events über `/api/log` (inkl. Header-Snapshot, masked params, Fehlerstatus)
 
 ## Deployment Update
 
